@@ -187,6 +187,8 @@ bool is_downloading_state(int const st)
 		, m_storage_constructor(p.storage)
 		, m_added_time(p.added_time ? p.added_time : std::time(nullptr))
 		, m_completed_time(p.completed_time)
+		, m_last_seen_complete(p.last_seen_complete)
+		, m_swarm_last_seen_complete(p.last_seen_complete)
 		, m_info_hash(p.info_hash)
 		, m_error_file(torrent_status::error_file_none)
 		, m_sequence_number(-1)
@@ -220,6 +222,7 @@ bool is_downloading_state(int const st)
 		, m_deleted(false)
 		, m_last_download(seconds32(p.last_download))
 		, m_last_upload(seconds32(p.last_upload))
+		, m_userdata(p.userdata)
 		, m_auto_managed(p.flags & torrent_flags::auto_managed)
 		, m_current_gauge_state(static_cast<std::uint32_t>(no_gauge_state))
 		, m_moving_storage(false)
@@ -751,7 +754,7 @@ bool is_downloading_state(int const st)
 #endif
 				));
 		aux::proxy_settings ps = m_ses.proxy();
-		conn->get(m_url, seconds(30), 0, &ps
+		conn->get(m_url, seconds(30), &ps
 			, 5
 			, settings().get_bool(settings_pack::anonymous_mode)
 				? "" : settings().get_str(settings_pack::user_agent));
@@ -1232,9 +1235,18 @@ bool is_downloading_state(int const st)
 		pause();
 	}
 
-	void torrent::on_piece_fail_sync(piece_index_t, piece_block) try
+	void torrent::on_piece_fail_sync(piece_index_t const piece, piece_block) try
 	{
 		if (m_abort) return;
+
+		// the user may have called force_recheck, which clears
+		// the piece picker
+		if (has_picker())
+		{
+			// unlock the piece and restore it, as if no block was
+			// ever downloaded for it.
+			m_picker->restore_piece(piece);
+		}
 
 		update_gauge();
 		// some peers that previously was no longer interesting may
@@ -1500,8 +1512,8 @@ bool is_downloading_state(int const st)
 
 	peer_request torrent::to_req(piece_block const& p) const
 	{
-		int block_offset = p.block_index * block_size();
-		int block = std::min(torrent_file().piece_size(
+		int const block_offset = p.block_index * block_size();
+		int const block = std::min(torrent_file().piece_size(
 			p.piece_index) - block_offset, block_size());
 		TORRENT_ASSERT(block > 0);
 		TORRENT_ASSERT(block <= block_size());
@@ -2137,13 +2149,9 @@ bool is_downloading_state(int const st)
 		if (status == status_t::fatal_disk_error)
 		{
 			TORRENT_ASSERT(m_outstanding_check_files == false);
-			m_add_torrent_params.reset();
 			handle_disk_error("check_resume_data", error);
 			auto_managed(false);
 			pause();
-			set_state(torrent_status::checking_files);
-			if (should_check_files()) start_checking();
-			return;
 		}
 
 		state_updated();
@@ -2282,7 +2290,7 @@ bool is_downloading_state(int const st)
 
 				// --- UNFINISHED PIECES ---
 
-				int const num_blocks_per_piece = torrent_file().piece_length() / block_size();
+				int const num_blocks_per_piece = torrent_file().blocks_per_piece();
 
 				for (auto const& p : m_add_torrent_params->unfinished_pieces)
 				{
@@ -2618,13 +2626,24 @@ bool is_downloading_state(int const st)
 #ifndef TORRENT_DISABLE_LOGGING
 		debug_log("on_piece_hashed, completed");
 #endif
-		if (m_auto_managed)
+
+		auto const& pack = settings();
+		auto get_int_setting = [&pack](int const name) {
+			int const v = pack.get_int(name);
+			if (v < 0) return std::numeric_limits<int>::max();
+			return v;
+		};
+		int const limit = std::min({
+			get_int_setting(settings_pack::active_downloads)
+			, get_int_setting(settings_pack::active_seeds)
+			, get_int_setting(settings_pack::active_limit)});
+		int const num_torrents = m_ses.num_torrents();
+		if (m_auto_managed && num_torrents > limit)
 		{
-			// if we're auto managed. assume we need to be paused until the auto
-			// managed logic runs again (which is triggered further down)
-			// setting flags to 0 prevents the disk cache from being evicted as a
-			// result of this
-			set_paused(true, {});
+			// if we're auto managed and we've reached one of the limits. Assume
+			// we need to be paused until the auto managed logic runs again
+			// (which is triggered further down)
+			set_paused(true);
 		}
 
 		// we're done checking! (this should cause a call to trigger_auto_manage)
@@ -2860,6 +2879,34 @@ bool is_downloading_state(int const st)
 		};
 	}
 
+	void torrent::update_tracker_endpoints()
+	{
+		for (auto& ae : m_trackers)
+		{
+			// update the endpoint list by adding entries for new listen sockets
+			// and removing entries for non-existent ones
+			std::size_t valid_endpoints = 0;
+			m_ses.for_each_listen_socket([&](aux::listen_socket_handle const& s) {
+				if (s.is_ssl() != is_ssl_torrent())
+					return;
+				for (auto& aep : ae.endpoints)
+				{
+					if (aep.socket != s) continue;
+					std::swap(ae.endpoints[valid_endpoints], aep);
+					valid_endpoints++;
+					return;
+				}
+
+				ae.endpoints.emplace_back(s, bool(m_complete_sent));
+				std::swap(ae.endpoints[valid_endpoints], ae.endpoints.back());
+				valid_endpoints++;
+			});
+
+			TORRENT_ASSERT(valid_endpoints <= ae.endpoints.size());
+			ae.endpoints.erase(ae.endpoints.begin() + int(valid_endpoints), ae.endpoints.end());
+		}
+	}
+
 	void torrent::announce_with_tracker(std::uint8_t e)
 	{
 		TORRENT_ASSERT(is_single_thread());
@@ -3008,32 +3055,14 @@ bool is_downloading_state(int const st)
 				, int(m_trackers.size()));
 		}
 #endif
+
+		update_tracker_endpoints();
+
 		for (auto& ae : m_trackers)
 		{
 #ifndef TORRENT_DISABLE_LOGGING
 			++idx;
 #endif
-			// update the endpoint list by adding entries for new listen sockets
-			// and removing entries for non-existent ones
-			std::size_t valid_endpoints = 0;
-			m_ses.for_each_listen_socket([&](aux::listen_socket_handle const& s) {
-				if (s.is_ssl() != is_ssl_torrent())
-					return;
-				for (auto& aep : ae.endpoints)
-				{
-					if (aep.socket != s) continue;
-					std::swap(ae.endpoints[valid_endpoints], aep);
-					valid_endpoints++;
-					return;
-				}
-
-				ae.endpoints.emplace_back(s, bool(m_complete_sent));
-				std::swap(ae.endpoints[valid_endpoints], ae.endpoints.back());
-				valid_endpoints++;
-			});
-
-			TORRENT_ASSERT(valid_endpoints <= ae.endpoints.size());
-			ae.endpoints.erase(ae.endpoints.begin() + int(valid_endpoints), ae.endpoints.end());
 
 			// if trackerid is not specified for tracker use default one, probably set explicitly
 			req.trackerid = ae.trackerid.empty() ? m_trackerid : ae.trackerid;
@@ -3606,8 +3635,14 @@ bool is_downloading_state(int const st)
 			|| tracker_idx == -1);
 
 		if (is_paused()) return;
+#ifndef TORRENT_DISABLE_LOGGING
+		bool found_one = false;
+#endif
 		if (tracker_idx == -1)
 		{
+			// make sure we check for new endpoints from the listen sockets
+			update_tracker_endpoints();
+
 			for (auto& e : m_trackers)
 			{
 				for (auto& aep : e.endpoints)
@@ -3615,8 +3650,10 @@ bool is_downloading_state(int const st)
 					aep.next_announce = (flags & torrent_handle::ignore_min_interval)
 						? time_point_cast<seconds32>(t) + seconds32(1)
 						: std::max(time_point_cast<seconds32>(t), aep.min_announce) + seconds32(1);
-					aep.min_announce = aep.next_announce;
 					aep.triggered_manually = true;
+#ifndef TORRENT_DISABLE_LOGGING
+					found_one = true;
+#endif
 				}
 			}
 		}
@@ -3630,10 +3667,19 @@ bool is_downloading_state(int const st)
 				aep.next_announce = (flags & torrent_handle::ignore_min_interval)
 					? time_point_cast<seconds32>(t) + seconds32(1)
 					: std::max(time_point_cast<seconds32>(t), aep.min_announce) + seconds32(1);
-				aep.min_announce = aep.next_announce;
 				aep.triggered_manually = true;
+#ifndef TORRENT_DISABLE_LOGGING
+				found_one = true;
+#endif
 			}
 		}
+
+#ifndef TORRENT_DISABLE_LOGGING
+		if (!found_one)
+		{
+			debug_log("*** found no tracker endpoints to announce");
+		}
+#endif
 		update_tracker_timer(aux::time_now32());
 	}
 
@@ -6448,7 +6494,7 @@ bool is_downloading_state(int const st)
 		// in either case; there will be no half-finished pieces.
 		if (has_picker())
 		{
-			int const num_blocks_per_piece = torrent_file().piece_length() / block_size();
+			int const num_blocks_per_piece = torrent_file().blocks_per_piece();
 
 			std::vector<piece_picker::downloading_piece> const q
 				= m_picker->get_download_queue();
@@ -8735,10 +8781,10 @@ bool is_downloading_state(int const st)
 			set_need_save_resume();
 		}
 
-		set_paused(true, flags | torrent_handle::clear_disk_cache);
+		set_paused(true, flags);
 	}
 
-	void torrent::do_pause(pause_flags_t const flags, bool const was_paused)
+	void torrent::do_pause(bool const was_paused)
 	{
 		TORRENT_ASSERT(is_single_thread());
 		if (!is_paused()) return;
@@ -8815,7 +8861,7 @@ bool is_downloading_state(int const st)
 		{
 			// this will make the storage close all
 			// files and flush all cached data
-			if (m_storage && (flags & torrent_handle::clear_disk_cache))
+			if (m_storage)
 			{
 				// the torrent_paused alert will be posted from on_torrent_paused
 				m_ses.disk_thread().async_stop_torrent(m_storage
@@ -8942,7 +8988,7 @@ bool is_downloading_state(int const st)
 			{
 				m_graceful_pause_mode = false;
 				update_gauge();
-				do_pause(flags, true);
+				do_pause(true);
 			}
 			return;
 		}
@@ -8957,7 +9003,7 @@ bool is_downloading_state(int const st)
 
 		m_graceful_pause_mode = bool(flags & torrent_handle::graceful_pause);
 
-		if (b) do_pause(flags);
+		if (b) do_pause();
 		else do_resume();
 	}
 
@@ -9135,12 +9181,35 @@ bool is_downloading_state(int const st)
 				break;
 		}
 
-		if (next_announce <= now) next_announce = now;
+#ifndef TORRENT_DISABLE_LOGGING
+		bool before_now = false;
+		bool none_eligible = false;
+#endif
+		if (next_announce <= now)
+		{
+			next_announce = now;
+#ifndef TORRENT_DISABLE_LOGGING
+			before_now = true;
+#endif
+		}
+		else if (next_announce == time_point32::max())
+		{
+			// if no tracker can be announced to, check again in a minute
+			next_announce = now + minutes32(1);
+#ifndef TORRENT_DISABLE_LOGGING
+			none_eligible = true;
+#endif
+		}
 
 #ifndef TORRENT_DISABLE_LOGGING
-		debug_log("*** update tracker timer: next_announce < now %d"
-			" m_waiting_tracker: %d next_announce_in: %d"
-			, next_announce <= now, m_waiting_tracker
+		debug_log("*** update tracker timer: "
+			"before_now: %d "
+			"none_eligible: %d "
+			"m_waiting_tracker: %d "
+			"next_announce_in: %d"
+			, before_now
+			, none_eligible
+			, m_waiting_tracker
 			, int(total_seconds(next_announce - now)));
 #endif
 
@@ -9403,7 +9472,7 @@ bool is_downloading_state(int const st)
 
 		// these counters are saved in the resume data, since they updated
 		// we need to save the resume data too
-		m_need_save_resume_data = true;
+		set_need_save_resume();
 
 		// if the rate is 0, there's no update because of network transfers
 		if (m_stat.low_pass_upload_rate() > 0 || m_stat.low_pass_download_rate() > 0)
@@ -10614,7 +10683,8 @@ bool is_downloading_state(int const st)
 		if (flags & torrent_handle::piece_granularity)
 			return;
 
-		TORRENT_ASSERT(has_picker());
+		if (!has_picker())
+			return;
 
 		std::vector<piece_picker::downloading_piece> q = m_picker->get_download_queue();
 
@@ -10760,9 +10830,27 @@ bool is_downloading_state(int const st)
 				get_handle());
 		}
 
-		if (m_stop_when_ready
+		bool const trigger_stop = m_stop_when_ready
 			&& !is_downloading_state(m_state)
-			&& is_downloading_state(s))
+			&& is_downloading_state(s);
+
+		// we need to update the state before calling pause(), because otherwise
+		// it may think we're still checking files, even though we're just
+		// leaving that state
+		m_state = s;
+
+		update_gauge();
+		update_want_peers();
+		update_want_tick();
+		update_state_list();
+
+		state_updated();
+
+#ifndef TORRENT_DISABLE_LOGGING
+		debug_log("set_state() %d", m_state);
+#endif
+
+		if (trigger_stop)
 		{
 #ifndef TORRENT_DISABLE_LOGGING
 			debug_log("stop_when_ready triggered");
@@ -10775,19 +10863,6 @@ bool is_downloading_state(int const st)
 			pause();
 			m_stop_when_ready = false;
 		}
-
-		m_state = s;
-
-#ifndef TORRENT_DISABLE_LOGGING
-		debug_log("set_state() %d", m_state);
-#endif
-
-		update_gauge();
-		update_want_peers();
-		update_want_tick();
-		update_state_list();
-
-		state_updated();
 
 #ifndef TORRENT_DISABLE_EXTENSIONS
 		for (auto& ext : m_extensions)
@@ -11235,11 +11310,9 @@ bool is_downloading_state(int const st)
 					debug_log("*** increment tracker fail count [ep: %s url: %s %d]"
 						, print_endpoint(aep->local_endpoint).c_str(), r.url.c_str(), aep->fails);
 #endif
-					// don't try to announce from this endpoint again
-					if (ec == boost::system::errc::address_family_not_supported
-						|| ec == boost::system::errc::host_unreachable
-						|| ec == lt::errors::announce_skipped)
+					if (ec == boost::system::errc::address_family_not_supported)
 					{
+						// don't try to announce from this endpoint again
 						aep->enabled = false;
 #ifndef TORRENT_DISABLE_LOGGING
 						debug_log("*** disabling endpoint [ep: %s url: %s ]"

@@ -256,6 +256,7 @@ set(libtorrent_aux_include_files
 	session_settings.hpp
 	session_udp_sockets.hpp
 	set_socket_buffer.hpp
+	set_traffic_class.hpp
 	socket_type.hpp
 	storage_piece_set.hpp
 	storage_utils.hpp
@@ -446,6 +447,7 @@ list(TRANSFORM libtorrent_kademlia_include_files PREPEND "include/libtorrent/kad
 feature_option(BUILD_SHARED_LIBS "build libtorrent as a shared library" ON)
 feature_option(static_runtime "build libtorrent with static runtime" OFF)
 
+set(THREADS_PREFER_PTHREAD_FLAG ON)
 find_public_dependency(Threads REQUIRED)
 
 if(CMAKE_CXX_COMPILER_ID MATCHES Clang)
@@ -461,18 +463,14 @@ if(CMAKE_CXX_COMPILER_ID MATCHES Clang)
 elseif(CMAKE_CXX_COMPILER_ID MATCHES GNU)
 	add_compile_options(
 		-Wall
-		-Wc++11-compat
 		-Wextra
-		-Wno-format-zero-length
-		-Wparentheses
 		-Wpedantic
 		-Wvla
+		-Wno-format-zero-length
 		-ftemplate-depth=512
 	)
 elseif(MSVC)
 	add_compile_options(
-		# https://devblogs.microsoft.com/cppblog/msvc-now-correctly-reports-__cplusplus/
-		/Zc:__cplusplus
 		/W4
 		# C4251: 'identifier' : class 'type' needs to have dll-interface to be
 		#        used by clients of class 'type2'
@@ -501,11 +499,6 @@ if(static_runtime)
 	set(Boost_USE_MULTITHREADED ON)
 	set(Boost_USE_STATIC_RUNTIME ON)
 	set(OPENSSL_MSVC_STATIC_RT ON)
-endif()
-
-if (NOT BUILD_SHARED_LIBS)
-	set(Boost_USE_STATIC_LIBS ON)
-	set(OPENSSL_USE_STATIC_LIBS ON)
 endif()
 
 add_library(torrent-rasterbar
@@ -617,7 +610,10 @@ if (WIN32)
 		)
 		target_compile_options(torrent-rasterbar
 			PRIVATE
-				/Zc:wchar_t /Zc:forScope # these compiler settings just make the compiler standard conforming
+				# https://docs.microsoft.com/en-us/cpp/build/reference/utf-8-set-source-and-executable-character-sets-to-utf-8?view=msvc-170
+				/utf-8
+				# https://devblogs.microsoft.com/cppblog/msvc-now-correctly-reports-__cplusplus/
+				/Zc:__cplusplus
 				/MP # for multi-core compilation
 				/bigobj # increase the number of sections for obj files
 		)
@@ -648,18 +644,21 @@ if (NOT Windows)
 			return 0;
 		}
 	]=])
+	string(REPLACE "std::atomic<int>" "std::atomic<std::int8_t>" ATOMICS8_TEST_SOURCE "${ATOMICS_TEST_SOURCE}")
 	string(REPLACE "std::atomic<int>" "std::atomic<std::int64_t>" ATOMICS64_TEST_SOURCE "${ATOMICS_TEST_SOURCE}")
 
 	if(APPLE)
 		set(CMAKE_REQUIRED_FLAGS "-std=c++11")
 	endif()
 	check_cxx_source_compiles("${ATOMICS_TEST_SOURCE}" HAVE_CXX_ATOMICS_WITHOUT_LIB)
+	check_cxx_source_compiles("${ATOMICS8_TEST_SOURCE}" HAVE_CXX_ATOMICS8_WITHOUT_LIB)
 	check_cxx_source_compiles("${ATOMICS64_TEST_SOURCE}" HAVE_CXX_ATOMICS64_WITHOUT_LIB)
-	if((NOT HAVE_CXX_ATOMICS_WITHOUT_LIB) OR (NOT HAVE_CXX_ATOMICS64_WITHOUT_LIB))
+	if((NOT HAVE_CXX_ATOMICS_WITHOUT_LIB) OR (NOT HAVE_CXX_ATOMICS8_WITHOUT_LIB) OR (NOT HAVE_CXX_ATOMICS64_WITHOUT_LIB))
 		set(CMAKE_REQUIRED_LIBRARIES "atomic")
 		check_cxx_source_compiles("${ATOMICS_TEST_SOURCE}" HAVE_CXX_ATOMICS_WITH_LIB)
+		check_cxx_source_compiles("${ATOMICS8_TEST_SOURCE}" HAVE_CXX_ATOMICS8_WITH_LIB)
 		check_cxx_source_compiles("${ATOMICS64_TEST_SOURCE}" HAVE_CXX_ATOMICS64_WITH_LIB)
-		if ((NOT HAVE_CXX_ATOMICS_WITH_LIB) OR (NOT HAVE_CXX_ATOMICS64_WITH_LIB))
+		if ((NOT HAVE_CXX_ATOMICS_WITH_LIB) OR (NOT HAVE_CXX_ATOMICS8_WITH_LIB) OR (NOT HAVE_CXX_ATOMICS64_WITH_LIB))
 			message(FATAL_ERROR "No native support for std::atomic, or libatomic not found!")
 		else()
 			message(STATUS "Linking with libatomic for atomics support")
@@ -911,6 +910,32 @@ install(
 	DESTINATION
 		${CMAKE_INSTALL_DATADIR}/cmake/Modules
 )
+
+if (MSVC)
+	set_target_properties(torrent-rasterbar
+	PROPERTIES
+		PDB_NAME torrent-rasterbar
+		PDB_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+		COMPILE_PDB_NAME torrent-rasterbar
+		COMPILE_PDB_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}
+	)
+
+	if (static_runtime)
+		set(PDB_INSTALL_DIR lib)
+	else()
+		set(PDB_INSTALL_DIR bin)
+	endif()
+
+	install(
+		FILES
+			${CMAKE_BINARY_DIR}/torrent-rasterbar.pdb
+		DESTINATION
+			${PDB_INSTALL_DIR}
+		CONFIGURATIONS
+			Debug RelWithDebInfo
+		OPTIONAL
+	)
+endif()
 
 # === build tools ===
 if (build_tools)

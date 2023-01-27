@@ -1,4 +1,50 @@
 
+	* fix issue with odd piece sizes
+
+1.2.18 released
+
+	* fix issue where stop-when-ready would not close files
+	* uTP performance, fix packet loss when sending is stalled
+	* uTP performance, prevent premature timeouts/resends
+	* uTP performance, more lenient nagle's algorithm to always allow one outstanding undersized packet
+	* uTP performance, piggy-back held back undersized packet with ACKs
+	* uTP performance, don't send redundant deferred ACKs
+	* fix wanted_done/done accounting when force-rechecking
+	* expose userdata via torrent_handle (back-port from 2.0)
+	* fix renaming of filenames that are too long for the filesystem
+	* made UPnP and LSD code avoid using select_reactor (to work around an issue on windows in boost.asio < 1.80)
+
+1.2.17 released
+
+	* fixed tracker connections spinning when hostname lookups stall
+	* fixed error in pkg-config file generation in Jamfile
+	* improve backwards compatibility with loading magnet link resume files
+	* fix bind-to-device for tracker announces and UPnP
+	* rename peer_tos setting to peer_dscp
+	* fix bdecode support for large strings (>= 100 MB)
+
+1.2.16 released
+
+	* send User-Agent field in anonymous mode
+	* fix python binding for settings_pack conversion
+	* fix DHT announce timer issue
+	* use DSCP_TRAFFIC_TYPE socket option on windows
+	* update default ToS setting according to RFC 8622
+	* keep trying to announce to trackers even when all fail
+	* don't disable announcing from local endpoints because of temporary failures
+	* fix issue in parsing UPnP XML response with multiple forwarding services
+
+1.2.15 released
+
+	* cache DNS lookups for SOCKS5 proxy
+	* fix stalled pieces on disk-full errors
+	* fix build configuration issue on NetBSD, OpenBSD and DragonFly
+	* make UTF-8 sanitization a bit stricter. This will re-write invalid UTF-8
+	  code points encoding surrogate pairs
+	* fix restoring last_seen_complete from resume data
+	* fix issue on MacOS where the DHT was not restarted on a network-up notification
+	* make remove_torrent flags be treated as flags (instead of an enum)
+
 1.2.14 released
 
 	* improve handling of seed flag in PEX messages

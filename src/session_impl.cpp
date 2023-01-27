@@ -91,6 +91,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include "libtorrent/aux_/set_socket_buffer.hpp"
 #include "libtorrent/aux_/generate_peer_id.hpp"
 #include "libtorrent/aux_/ffs.hpp"
+#include "libtorrent/aux_/set_traffic_class.hpp"
 
 #ifndef TORRENT_DISABLE_LOGGING
 
@@ -288,12 +289,16 @@ namespace aux {
 
 				// we assume this listen_socket_t is local-network under some
 				// conditions, meaning we won't announce it to internet trackers
+				// if "routes" does not contain a single route to the internet,
+				// we don't use the last case. On MacOS, we can be notified of
+				// network changes *before* the routing table is updated
 				bool const local
 					= ipface.interface_address.is_loopback()
 					|| is_link_local(ipface.interface_address)
 					|| (ipface.flags & if_flags::loopback)
 					|| (!is_global(ipface.interface_address)
 						&& !(ipface.flags & if_flags::pointopoint)
+						&& has_any_internet_route(routes)
 						&& !has_internet_route(ipface.name, family(ipface.interface_address), routes));
 
 				eps.emplace_back(ipface.interface_address, uep.port, uep.device
@@ -1784,7 +1789,7 @@ namespace {
 		// change after the session is up and listening, at no other point
 		// set_proxy_settings is called with the correct proxy configuration,
 		// internally, this method handle the SOCKS5's connection logic
-		ret->udp_sock->sock.set_proxy_settings(proxy(), m_alerts);
+		ret->udp_sock->sock.set_proxy_settings(proxy(), m_alerts, get_resolver());
 
 		ADD_OUTSTANDING_ASYNC("session_impl::on_udp_packet");
 		ret->udp_sock->sock.async_read(aux::make_handler(std::bind(&session_impl::on_udp_packet
@@ -2093,9 +2098,9 @@ namespace {
 			}
 		}
 
-		if (m_settings.get_int(settings_pack::peer_tos) != 0)
+		if (m_settings.get_int(settings_pack::peer_dscp) != 0)
 		{
-			update_peer_tos();
+			update_peer_dscp();
 		}
 
 		ec.clear();
@@ -2150,7 +2155,7 @@ namespace {
 	namespace {
 		template <typename MapProtocol, typename ProtoType, typename EndpointType>
 		void map_port(MapProtocol& m, ProtoType protocol, EndpointType const& ep
-			, port_mapping_t& map_handle)
+			, port_mapping_t& map_handle, std::string const& device)
 		{
 			if (map_handle != port_mapping_t{-1}) m.delete_mapping(map_handle);
 			map_handle = port_mapping_t{-1};
@@ -2163,7 +2168,7 @@ namespace {
 
 			// only update this mapping if we actually have a socket listening
 			if (ep != EndpointType())
-				map_handle = m.add_mapping(protocol, ep.port(), ep);
+				map_handle = m.add_mapping(protocol, ep.port(), ep, device);
 		}
 	}
 
@@ -2176,16 +2181,16 @@ namespace {
 		if ((mask & remap_natpmp) && s.natpmp_mapper)
 		{
 			map_port(*s.natpmp_mapper, portmap_protocol::tcp, tcp_ep
-				, s.tcp_port_mapping[portmap_transport::natpmp].mapping);
+				, s.tcp_port_mapping[portmap_transport::natpmp].mapping, s.device);
 			map_port(*s.natpmp_mapper, portmap_protocol::udp, make_tcp(udp_ep)
-				, s.udp_port_mapping[portmap_transport::natpmp].mapping);
+				, s.udp_port_mapping[portmap_transport::natpmp].mapping, s.device);
 		}
 		if ((mask & remap_upnp) && s.upnp_mapper)
 		{
 			map_port(*s.upnp_mapper, portmap_protocol::tcp, tcp_ep
-				, s.tcp_port_mapping[portmap_transport::upnp].mapping);
+				, s.tcp_port_mapping[portmap_transport::upnp].mapping, s.device);
 			map_port(*s.upnp_mapper, portmap_protocol::udp, make_tcp(udp_ep)
-				, s.udp_port_mapping[portmap_transport::upnp].mapping);
+				, s.udp_port_mapping[portmap_transport::upnp].mapping, s.device);
 		}
 	}
 
@@ -2745,12 +2750,6 @@ namespace {
 	void session_impl::incoming_connection(std::shared_ptr<socket_type> const& s)
 	{
 		TORRENT_ASSERT(is_single_thread());
-
-		// don't accept any connections from our local sockets if we're using a
-		// proxy
-		if (m_settings.get_int(settings_pack::proxy_type) != settings_pack::none
-			&& m_settings.get_bool(settings_pack::proxy_peer_connections))
-			return;
 
 		if (m_paused)
 		{
@@ -3581,7 +3580,7 @@ namespace {
 		if (m_dht)
 			m_dht->add_node(n);
 		else if (m_dht_nodes.size() >= 200)
-			m_dht_nodes[random(m_dht_nodes.size() - 1)] = n;
+			m_dht_nodes[random(uint32_t(m_dht_nodes.size()) - 1)] = n;
 		else
 			m_dht_nodes.push_back(n);
 	}
@@ -3649,23 +3648,7 @@ namespace {
 
 		TORRENT_ASSERT(m_dht);
 
-		// announce to DHT every 15 minutes
-		int delay = std::max(m_settings.get_int(settings_pack::dht_announce_interval)
-			/ std::max(int(m_torrents.size()), 1), 1);
-
-		if (!m_dht_torrents.empty())
-		{
-			// we have prioritized torrents that need
-			// an initial DHT announce. Don't wait too long
-			// until we announce those.
-			delay = std::min(4, delay);
-		}
-
-		ADD_OUTSTANDING_ASYNC("session_impl::on_dht_announce");
-		error_code ec;
-		m_dht_announce_timer.expires_from_now(seconds(delay), ec);
-		m_dht_announce_timer.async_wait([this](error_code const& err)
-			{ this->wrap(&session_impl::on_dht_announce, err); });
+		update_dht_announce_interval();
 
 		if (!m_dht_torrents.empty())
 		{
@@ -4813,9 +4796,12 @@ namespace {
 		std::tie(torrent_ptr, added) = add_torrent_impl(params, ec);
 
 		torrent_handle const handle(torrent_ptr);
-		m_alerts.emplace_alert<add_torrent_alert>(handle, params, ec);
 
-		if (!torrent_ptr) return handle;
+		if (!torrent_ptr)
+		{
+			m_alerts.emplace_alert<add_torrent_alert>(handle, params, ec);
+			return handle;
+		}
 
 		// params.info_hash should have been initialized by add_torrent_impl()
 		TORRENT_ASSERT(params.info_hash != sha1_hash(nullptr));
@@ -4838,6 +4824,7 @@ namespace {
 		if (!added)
 		{
 			abort_torrent.disarm();
+			m_alerts.emplace_alert<add_torrent_alert>(handle, params, ec);
 			return handle;
 		}
 
@@ -4863,6 +4850,8 @@ namespace {
 				: params.uuid
 #endif
 		);
+
+		m_alerts.emplace_alert<add_torrent_alert>(handle, params, ec);
 
 		// once we successfully add the torrent, we can disarm the abort action
 		abort_torrent.disarm();
@@ -5380,7 +5369,7 @@ namespace {
 	void session_impl::update_proxy()
 	{
 		for (auto& i : m_listen_sockets)
-			i->udp_sock->sock.set_proxy_settings(proxy(), m_alerts);
+			i->udp_sock->sock.set_proxy_settings(proxy(), m_alerts, get_resolver());
 	}
 
 	void session_impl::update_ip_notifier()
@@ -6211,6 +6200,7 @@ namespace {
 		// since we're destructing the session, no more alerts will make it out to
 		// the user. So stop posting them now
 		m_alerts.set_alert_mask({});
+		m_alerts.set_notify_function({});
 
 		// this is not allowed to be the network thread!
 //		TORRENT_ASSERT(is_not_thread());
@@ -6339,37 +6329,24 @@ namespace {
 #endif // DEPRECATE
 
 
-	namespace {
-		template <typename Socket>
-		void set_tos(Socket& s, int v, error_code& ec)
-		{
-#if defined IPV6_TCLASS
-			if (is_v6(s.local_endpoint(ec)))
-				s.set_option(traffic_class(char(v)), ec);
-			else if (!ec)
-#endif
-				s.set_option(type_of_service(char(v)), ec);
-		}
-	}
-
 	// TODO: 2 this should be factored into the udp socket, so we only have the
 	// code once
-	void session_impl::update_peer_tos()
+	void session_impl::update_peer_dscp()
 	{
-		int const tos = m_settings.get_int(settings_pack::peer_tos);
+		int const value = m_settings.get_int(settings_pack::peer_dscp);
 		for (auto const& l : m_listen_sockets)
 		{
 			if (l->sock)
 			{
 				error_code ec;
-				set_tos(*l->sock, tos, ec);
+				set_traffic_class(*l->sock, value, ec);
 
 #ifndef TORRENT_DISABLE_LOGGING
 				if (should_log())
 				{
-					session_log(">>> SET_TOS [ tcp (%s %d) tos: %x e: %s ]"
+					session_log(">>> SET_DSCP [ tcp (%s %d) value: %x e: %s ]"
 						, l->sock->local_endpoint().address().to_string().c_str()
-						, l->sock->local_endpoint().port(), tos, ec.message().c_str());
+						, l->sock->local_endpoint().port(), value, ec.message().c_str());
 				}
 #endif
 			}
@@ -6377,15 +6354,15 @@ namespace {
 			if (l->udp_sock)
 			{
 				error_code ec;
-				set_tos(l->udp_sock->sock, tos, ec);
+				set_traffic_class(l->udp_sock->sock, value, ec);
 
 #ifndef TORRENT_DISABLE_LOGGING
 				if (should_log())
 				{
-					session_log(">>> SET_TOS [ udp (%s %d) tos: %x e: %s ]"
+					session_log(">>> SET_DSCP [ udp (%s %d) value: %x e: %s ]"
 						, l->udp_sock->sock.local_endpoint().address().to_string().c_str()
 						, l->udp_sock->sock.local_port()
-						, tos, ec.message().c_str());
+						, value, ec.message().c_str());
 				}
 #endif
 			}
@@ -6604,6 +6581,15 @@ namespace {
 		error_code ec;
 		int delay = std::max(m_settings.get_int(settings_pack::dht_announce_interval)
 			/ std::max(int(m_torrents.size()), 1), 1);
+
+		if (!m_dht_torrents.empty())
+		{
+			// we have prioritized torrents that need
+			// an initial DHT announce. Don't wait too long
+			// until we announce those.
+			delay = std::min(4, delay);
+		}
+
 		m_dht_announce_timer.expires_from_now(seconds(delay), ec);
 		m_dht_announce_timer.async_wait([this](error_code const& e) {
 			this->wrap(&session_impl::on_dht_announce, e); });
@@ -6895,10 +6881,11 @@ namespace {
 		std::vector<port_mapping_t> ret;
 		for (auto& s : m_listen_sockets)
 		{
-			if (s->upnp_mapper) ret.push_back(s->upnp_mapper->add_mapping(t, external_port
-				, tcp::endpoint(s->local_endpoint.address(), static_cast<std::uint16_t>(local_port))));
-			if (s->natpmp_mapper) ret.push_back(s->natpmp_mapper->add_mapping(t, external_port
-				, tcp::endpoint(s->local_endpoint.address(), static_cast<std::uint16_t>(local_port))));
+			tcp::endpoint const ep{s->local_endpoint.address(), static_cast<std::uint16_t>(local_port)};
+			if (s->upnp_mapper) ret.push_back(s->upnp_mapper->add_mapping(
+				t, external_port, ep, s->device));
+			if (s->natpmp_mapper) ret.push_back(s->natpmp_mapper->add_mapping(
+				t, external_port, ep, s->device));
 		}
 		return ret;
 	}

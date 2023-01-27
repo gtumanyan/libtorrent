@@ -235,7 +235,7 @@ bool is_absolute_path(std::string const& f)
 #if defined(TORRENT_WINDOWS) || defined(TORRENT_OS2)
 	int i = 0;
 	// match the xx:\ or xx:/ form
-	while (f[i] && strchr("abcdefghijklmnopqrstuvxyz", f[i])) ++i;
+	while (f[i] && strchr("abcdefghijklmnopqrstuvxyzABCDEFGHIJKLMNOPQRSTUVXYZ", f[i])) ++i;
 	if (i < int(f.size()-1) && f[i] == ':' && (f[i+1] == '\\' || f[i+1] == '/'))
 		return true;
 
@@ -1115,7 +1115,7 @@ int main(int argc, char* argv[])
 
 	if (argc == 1)
 	{
-		std::fprintf(stderr, R"(usage: client_test [OPTIONS] [TORRENT|MAGNETURL]
+		std::fprintf(stderr, R"(usage: client_test [OPTIONS] [TORRENT|MAGNETURL|URL]
 OPTIONS:
 
 CLIENT OPTIONS
@@ -1158,7 +1158,8 @@ BITTORRENT OPTIONS
 
 NETWORK OPTIONS
   -x <file>             loads an emule IP-filter file
-  -Y                    Rate limit local peers)"
+  -Y                    Rate limit local peers
+)"
 #if TORRENT_USE_I2P
 R"(  -i <i2p-host>         the hostname to an I2P SAM bridge to use
 )"
@@ -1170,6 +1171,7 @@ DISK OPTIONS
 
 TORRENT is a path to a .torrent file
 MAGNETURL is a magnet link
+URL is a url to a torrent file
 
 alert mask flags:
 	error peer port_mapping storage tracker connect status ip_block
@@ -1371,7 +1373,25 @@ examples:
 
 	for (auto const& i : torrents)
 	{
-		if (i.substr(0, 7) == "magnet:") add_magnet(ses, i);
+		if (i.substr(0, 7) == "http://"
+			|| i.substr(0, 8) == "https://"
+			|| i.substr(0, 7) == "magnet:")
+		{
+			add_torrent_params p;
+			if (seed_mode) p.flags |= add_torrent_params::flag_seed_mode;
+			if (disable_storage) p.storage = lt::disabled_storage_constructor;
+			if (share_mode) p.flags |= add_torrent_params::flag_share_mode;
+			p.save_path = save_path;
+			p.storage_mode = allocation_mode;
+			p.url = i.to_string();
+
+			if (i.substr(0, 7) == "magnet:") add_magnet(ses, i);
+
+			printf("adding URL: %s\n", i.to_string());
+			ses.async_add_torrent(p);
+		}
+
+		// if it's a torrent file, open it as usual
 		else add_torrent(ses, i.to_string());
 	}
 

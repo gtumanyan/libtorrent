@@ -233,8 +233,14 @@ namespace libtorrent {
 		// in anonymous mode we omit the user agent to mitigate fingerprinting of
 		// the client. Private torrents is an exception because some private
 		// trackers may require the user agent
-		std::string const user_agent = settings.get_bool(settings_pack::anonymous_mode)
-			&& !tracker_req().private_torrent ? "" : settings.get_str(settings_pack::user_agent);
+		bool const anon_user = settings.get_bool(settings_pack::anonymous_mode)
+			&& !tracker_req().private_torrent;
+		std::string const user_agent = anon_user
+			? "curl/7.81.0"
+			: settings.get_str(settings_pack::user_agent);
+
+		auto const ls = bind_socket();
+		bind_info_t bi{ls.device(), ls.get_local_endpoint().address()};
 
 		// when sending stopped requests, prefer the cached DNS entry
 		// to avoid being blocked for slow or failing responses. Chances
@@ -242,9 +248,8 @@ namespace libtorrent {
 		// attempt. It's not worth stalling shutdown.
 		aux::proxy_settings ps(settings);
 		m_tracker_connection->get(url, seconds(timeout)
-			, tracker_req().event == tracker_request::stopped ? 2 : 1
 			, ps.proxy_tracker_connections ? &ps : nullptr
-			, 5, user_agent, bind_interface()
+			, 5, user_agent, bi
 			, (tracker_req().event == tracker_request::stopped
 				? resolver_interface::cache_only : resolver_flags{})
 				| resolver_interface::abort_on_shutdown
