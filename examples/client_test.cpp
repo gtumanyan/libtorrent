@@ -494,11 +494,6 @@ bool disable_storage = false;
 
 bool quit = false;
 
-void signal_handler(int)
-{
-	// make the main loop terminate
-	quit = true;
-}
 
 // if non-empty, a peer that will be added to all torrents
 std::string peer;
@@ -575,11 +570,13 @@ void assign_setting(lt::settings_pack& settings, std::string const& key, char co
 				{"i2p_proxy"_sv, settings_pack::i2p_proxy},
 			};
 
-			auto const it = enums.find(lt::string_view(value));
-			if (it != enums.end())
 			{
-				settings.set_int(sett_name, it->second);
-				break;
+				auto const it = enums.find(lt::string_view(value));
+				if (it != enums.end())
+				{
+					settings.set_int(sett_name, it->second);
+					break;
+				}
 			}
 
 			static std::map<lt::string_view, lt::alert_category_t> const alert_categories = {
@@ -1387,7 +1384,7 @@ examples:
 
 			if (i.substr(0, 7) == "magnet:") add_magnet(ses, i);
 
-			printf("adding URL: %s\n", i.to_string());
+			printf("adding URL: %s\n", i.to_string().c_str());
 			ses.async_add_torrent(p);
 		}
 
